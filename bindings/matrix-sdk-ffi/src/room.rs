@@ -237,7 +237,8 @@ impl Room {
             }
         }
 
-        // Otherwise, fallback to the classical path.
+        // Otherwise, create a synthetic [`EventTimelineItem`] using the classical
+        // [`Room`] path.
         let latest_event = match self.inner.latest_event() {
             Some(latest_event) => matrix_sdk_ui::timeline::EventTimelineItem::from_latest_event(
                 self.inner.client(),
@@ -249,6 +250,7 @@ impl Room {
             .map(Arc::new),
             None => None,
         };
+
         Ok(RoomInfo::new(&self.inner, avatar_url, latest_event).await?)
     }
 

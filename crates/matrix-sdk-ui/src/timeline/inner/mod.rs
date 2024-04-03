@@ -17,6 +17,7 @@ use std::collections::BTreeSet;
 use std::{fmt, sync::Arc};
 
 use as_variant::as_variant;
+use eyeball::SharedObservable;
 use eyeball_im::{ObservableVectorEntry, VectorDiff};
 use eyeball_im_util::vector::VectorObserverExt;
 use futures_core::Stream;
@@ -24,7 +25,14 @@ use imbl::Vector;
 use itertools::Itertools;
 #[cfg(all(test, feature = "e2e-encryption"))]
 use matrix_sdk::crypto::OlmMachine;
-use matrix_sdk::{deserialized_responses::SyncTimelineEvent, Error, Result, Room};
+use matrix_sdk::{
+    deserialized_responses::SyncTimelineEvent,
+    event_cache::{
+        paginator::{PaginableRoom, PaginationResult, Paginator, PaginatorError, StartFromResult},
+        RoomEventCache,
+    },
+    Result, Room,
+};
 #[cfg(test)]
 use ruma::events::receipt::ReceiptEventContent;
 #[cfg(all(test, feature = "e2e-encryption"))]
@@ -59,8 +67,9 @@ use super::{
     reactions::ReactionToggleResult,
     traits::RoomDataProvider,
     util::{rfind_event_by_id, rfind_event_item, RelativePosition},
-    AnnotationKey, EventSendState, EventTimelineItem, InReplyToDetails, Message, Profile,
-    RepliedToEvent, TimelineDetails, TimelineItem, TimelineItemContent, TimelineItemKind,
+    AnnotationKey, BackPaginationStatus, Error, EventSendState, EventTimelineItem,
+    InReplyToDetails, Message, Profile, RepliedToEvent, TimelineDetails, TimelineFocus,
+    TimelineItem, TimelineItemContent, TimelineItemKind,
 };
 use crate::{
     timeline::{day_dividers::DayDividerAdjuster, TimelineEventFilterFn},
@@ -74,11 +83,100 @@ pub(super) use self::state::{
     TimelineInnerStateTransaction,
 };
 
+/// Data associated to the current timeline focus.
+#[derive(Debug)]
+enum TimelineFocusData {
+    /// The timeline receives live events from the sync.
+    Live,
+
+    /// The timeline is focused on a single event, and it can expand in one
+    /// direction or another.
+    Event { paginator: Paginator },
+}
+
+#[derive(Debug)]
+pub(crate) struct Focus {
+    /// Observable for whether a pagination is currently running.
+    ///
+    /// Only set in [`TimelineFocus::Live`] mode. It exists for all the focus
+    /// modes, so that we never re-create a new observable (which would be
+    /// confused, as callers would need to re-subscribe after switching
+    /// mode).
+    pub(crate) back_pagination_status: SharedObservable<BackPaginationStatus>,
+
+    /// Current focus of this timeline.
+    pub(crate) kind: SharedObservable<TimelineFocus>,
+
+    data: RwLock<TimelineFocusData>,
+}
+
+impl Default for Focus {
+    fn default() -> Self {
+        // By default, the [`Focus`] goes into live mode.
+        Self {
+            back_pagination_status: SharedObservable::new(BackPaginationStatus::Idle),
+            kind: SharedObservable::new(TimelineFocus::Live),
+            data: RwLock::new(TimelineFocusData::Live),
+        }
+    }
+}
+
+impl Focus {
+    async fn switch_to_live(&self) {
+        *self.data.write().await = TimelineFocusData::Live;
+
+        self.kind.set(TimelineFocus::Live);
+    }
+
+    async fn switch_to_event(
+        &self,
+        event: OwnedEventId,
+        room: Box<dyn PaginableRoom>,
+    ) -> Result<StartFromResult, PaginatorError> {
+        let paginator = Paginator::new(room);
+
+        let result = paginator.start_from(&event).await?;
+
+        *self.data.write().await = TimelineFocusData::Event { paginator };
+
+        self.kind.set(TimelineFocus::Event(event));
+
+        Ok(result)
+    }
+
+    async fn paginate_backward(&self) -> Result<PaginationResult, Error> {
+        match &*self.data.read().await {
+            TimelineFocusData::Live => Err(Error::NotEventFocusMode),
+            TimelineFocusData::Event { paginator } => {
+                Ok(paginator.paginate_backward().await.map_err(Error::PaginationError)?)
+            }
+        }
+    }
+
+    async fn paginate_forward(&self) -> Result<PaginationResult, Error> {
+        match &*self.data.read().await {
+            TimelineFocusData::Live => Err(Error::NotEventFocusMode),
+            TimelineFocusData::Event { paginator } => {
+                Ok(paginator.paginate_forward().await.map_err(Error::PaginationError)?)
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct TimelineInner<P: RoomDataProvider = Room> {
+    /// Inner mutable state.
     state: Arc<RwLock<TimelineInnerState>>,
+
+    /// A [`Room`] implementation, providing data.
+    ///
+    /// Useful for testing only.
     room_data_provider: P,
+
+    /// Settings applied to this timeline.
     settings: TimelineInnerSettings,
+
+    pub(crate) focus: Arc<Focus>,
 }
 
 #[derive(Debug, Clone)]
@@ -219,12 +317,74 @@ impl<P: RoomDataProvider> TimelineInner<P> {
             state: Arc::new(RwLock::new(state)),
             room_data_provider,
             settings: TimelineInnerSettings::default(),
+            focus: Arc::new(Focus::default()),
         }
     }
 
     pub(super) fn with_settings(mut self, settings: TimelineInnerSettings) -> Self {
         self.settings = settings;
         self
+    }
+
+    /// Switches the focus of the timeline to the new given one.
+    ///
+    /// May start requests in the background.
+    ///
+    /// Returns whether switching to the desired mode worked.
+    pub(super) async fn switch_focus(
+        &self,
+        focus: TimelineFocus,
+        event_cache: &RoomEventCache,
+    ) -> Result<(), Error> {
+        if focus == self.focus.kind.get() {
+            // No-op: don't do anything.
+            return Ok(());
+        }
+
+        match focus {
+            TimelineFocus::Live => {
+                self.focus.switch_to_live().await;
+
+                // Note: only clear events if we suspect there could be a hole, aka a previous
+                // pagination didn't have a next-batch token.
+                // TODO(bnjbvr): implement the above behavior ^
+
+                self.clear().await;
+                let (events, _) = event_cache.subscribe().await.map_err(Error::EventCacheError)?;
+                self.add_events_at(events, TimelineEnd::Back { from_cache: true }).await;
+            }
+
+            TimelineFocus::Event(ev) => {
+                let paginable_room = Box::new(self.room_data_provider.clone());
+                let response = self
+                    .focus
+                    .switch_to_event(ev, paginable_room)
+                    .await
+                    .map_err(Error::PaginationError)?;
+                self.clear().await;
+                self.add_events_at(response.events, TimelineEnd::Back { from_cache: false }).await;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Runs a back-pagination, in focused mode.
+    ///
+    /// Returns whether we hit the start of the timeline.
+    pub(super) async fn paginate_backward_focused(&self) -> Result<bool, Error> {
+        let result = self.focus.paginate_backward().await?;
+        self.add_events_at(result.events, TimelineEnd::Front).await;
+        Ok(result.hit_end_of_timeline)
+    }
+
+    /// Runs a forward-pagination, in focused mode.
+    ///
+    /// Returns whether we hit the end of the timeline.
+    pub(super) async fn paginate_forward_focused(&self) -> Result<bool, Error> {
+        let result = self.focus.paginate_forward().await?;
+        self.add_events_at(result.events, TimelineEnd::Back { from_cache: false }).await;
+        Ok(result.hit_end_of_timeline)
     }
 
     /// Get a copy of the current items in the list.
@@ -266,7 +426,7 @@ impl<P: RoomDataProvider> TimelineInner<P> {
     pub(super) async fn toggle_reaction_local(
         &self,
         annotation: &Annotation,
-    ) -> Result<ReactionAction, super::Error> {
+    ) -> Result<ReactionAction, Error> {
         let mut state = self.state.write().await;
 
         let user_id = self.room_data_provider.own_user_id();
@@ -589,7 +749,7 @@ impl<P: RoomDataProvider> TimelineInner<P> {
         &self,
         annotation: &Annotation,
         result: &ReactionToggleResult,
-    ) -> Result<ReactionAction, super::Error> {
+    ) -> Result<ReactionAction, Error> {
         let mut state = self.state.write().await;
         let user_id = self.room_data_provider.own_user_id();
         let annotation_key: AnnotationKey = annotation.into();
@@ -829,7 +989,7 @@ impl<P: RoomDataProvider> TimelineInner<P> {
         self.set_non_ready_sender_profiles(TimelineDetails::Pending).await;
     }
 
-    pub(super) async fn set_sender_profiles_error(&self, error: Arc<Error>) {
+    pub(super) async fn set_sender_profiles_error(&self, error: Arc<matrix_sdk::Error>) {
         self.set_non_ready_sender_profiles(TimelineDetails::Error(error)).await;
     }
 
@@ -971,11 +1131,11 @@ impl TimelineInner {
                     None
                 }
             },
+            Ok(None) => None,
             Err(e) => {
                 error!("Failed to get fully-read account data from the store: {e}");
                 None
             }
-            _ => None,
         }
     }
 
@@ -987,10 +1147,7 @@ impl TimelineInner {
     }
 
     #[instrument(skip(self))]
-    pub(super) async fn fetch_in_reply_to_details(
-        &self,
-        event_id: &EventId,
-    ) -> Result<(), super::Error> {
+    pub(super) async fn fetch_in_reply_to_details(&self, event_id: &EventId) -> Result<(), Error> {
         let state = self.state.write().await;
         let (index, item) = rfind_event_by_id(&state.items, event_id)
             .ok_or(super::Error::RemoteEventNotInTimeline)?;
@@ -1146,7 +1303,7 @@ async fn fetch_replied_to_event(
     message: &Message,
     in_reply_to: &EventId,
     room: &Room,
-) -> Result<TimelineDetails<Box<RepliedToEvent>>, super::Error> {
+) -> Result<TimelineDetails<Box<RepliedToEvent>>, Error> {
     if let Some((_, item)) = rfind_event_by_id(&state.items, in_reply_to) {
         let details = TimelineDetails::Ready(Box::new(RepliedToEvent {
             content: item.content.clone(),

@@ -25,7 +25,11 @@ use eyeball_im::VectorDiff;
 use futures_core::Stream;
 use futures_util::{FutureExt, StreamExt};
 use indexmap::IndexMap;
-use matrix_sdk::deserialized_responses::{SyncTimelineEvent, TimelineEvent};
+use matrix_sdk::{
+    deserialized_responses::{SyncTimelineEvent, TimelineEvent},
+    event_cache::paginator::{PaginableRoom, PaginatorError},
+    room::{EventWithContextResponse, Messages, MessagesOptions},
+};
 use matrix_sdk_base::latest_event::LatestEvent;
 use matrix_sdk_test::{EventBuilder, ALICE, BOB};
 use ruma::{
@@ -281,6 +285,22 @@ struct TestRoomDataProvider {
 impl TestRoomDataProvider {
     fn with_initial_user_receipts(initial_user_receipts: ReadReceiptMap) -> Self {
         Self { initial_user_receipts }
+    }
+}
+
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+impl PaginableRoom for TestRoomDataProvider {
+    async fn event_with_context(
+        &self,
+        event_id: &EventId,
+        _lazy_load_members: bool,
+    ) -> Result<EventWithContextResponse, PaginatorError> {
+        unimplemented!();
+    }
+
+    async fn messages(&self, _opts: MessagesOptions) -> Result<Messages, PaginatorError> {
+        unimplemented!();
     }
 }
 

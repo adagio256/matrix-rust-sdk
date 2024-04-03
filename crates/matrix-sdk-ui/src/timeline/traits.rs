@@ -16,7 +16,10 @@ use async_trait::async_trait;
 use indexmap::IndexMap;
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk::{deserialized_responses::TimelineEvent, Result};
-use matrix_sdk::{event_cache, Room};
+use matrix_sdk::{
+    event_cache::{self, paginator::PaginableRoom},
+    Room,
+};
 use matrix_sdk_base::latest_event::LatestEvent;
 use ruma::{
     events::receipt::{Receipt, ReceiptThread, ReceiptType},
@@ -64,7 +67,7 @@ impl RoomExt for Room {
 }
 
 #[async_trait]
-pub(super) trait RoomDataProvider: Clone + Send + Sync + 'static {
+pub(super) trait RoomDataProvider: Clone + Send + Sync + 'static + PaginableRoom {
     fn own_user_id(&self) -> &UserId;
     fn room_version(&self) -> RoomVersionId;
     async fn profile_from_user_id(&self, user_id: &UserId) -> Option<Profile>;

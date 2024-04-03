@@ -14,7 +14,6 @@
 
 use std::{collections::BTreeSet, sync::Arc};
 
-use eyeball::SharedObservable;
 use futures_util::{pin_mut, StreamExt};
 use matrix_sdk::{
     event_cache::{self, RoomEventCacheUpdate},
@@ -33,7 +32,7 @@ use super::to_device::{handle_forwarded_room_key_event, handle_room_key_event};
 use super::{
     inner::{TimelineInner, TimelineInnerSettings},
     queue::send_queued_messages,
-    BackPaginationStatus, Timeline, TimelineDropHandle,
+    Timeline, TimelineDropHandle, TimelineFocus,
 };
 use crate::{timeline::inner::TimelineEnd, unable_to_decrypt_hook::UtdHookManager};
 
@@ -44,6 +43,7 @@ use crate::{timeline::inner::TimelineEnd, unable_to_decrypt_hook::UtdHookManager
 pub struct TimelineBuilder {
     room: Room,
     settings: TimelineInnerSettings,
+    focus: TimelineFocus,
 
     /// An optional hook to call whenever we run into an unable-to-decrypt or a
     /// late-decryption event.
@@ -56,7 +56,16 @@ impl TimelineBuilder {
             room: room.clone(),
             settings: TimelineInnerSettings::default(),
             unable_to_decrypt_hook: None,
+            focus: TimelineFocus::Live,
         }
+    }
+
+    /// Sets up the initial focus for this timeline.
+    ///
+    /// This can be changed later on while the timeline is alive.
+    pub fn with_focus(mut self, focus: TimelineFocus) -> Self {
+        self.focus = focus;
+        self
     }
 
     /// Sets up a hook to catch unable-to-decrypt (UTD) events for the timeline
@@ -125,7 +134,7 @@ impl TimelineBuilder {
         )
     )]
     pub async fn build(self) -> event_cache::Result<Timeline> {
-        let Self { room, settings, unable_to_decrypt_hook } = self;
+        let Self { room, settings, unable_to_decrypt_hook, focus } = self;
 
         let client = room.client();
         let event_cache = client.event_cache();
@@ -134,22 +143,28 @@ impl TimelineBuilder {
         event_cache.subscribe()?;
 
         let (room_event_cache, event_cache_drop) = room.event_cache().await?;
-        let (events, mut event_subscriber) = room_event_cache.subscribe().await?;
+        let (initial_events, mut event_subscriber) = room_event_cache.subscribe().await?;
+        let has_initial_events = !initial_events.is_empty();
 
-        let has_events = !events.is_empty();
         let track_read_marker_and_receipts = settings.track_read_receipts;
 
         let mut inner = TimelineInner::new(room, unable_to_decrypt_hook).with_settings(settings);
+
+        let is_live_focus = matches!(focus, TimelineFocus::Live);
+        inner.switch_focus(focus, &room_event_cache).await;
 
         if track_read_marker_and_receipts {
             inner.populate_initial_user_receipt(ReceiptType::Read).await;
             inner.populate_initial_user_receipt(ReceiptType::ReadPrivate).await;
         }
 
-        if has_events {
-            inner.add_events_at(events, TimelineEnd::Back { from_cache: true }).await;
+        if is_live_focus && has_initial_events {
+            inner.add_events_at(initial_events, TimelineEnd::Back { from_cache: true }).await;
         }
+
         if track_read_marker_and_receipts {
+            // Note: It's an optimization to call this after adding events, as we'll do the
+            // work of matching the read marker against its event only once.
             inner.load_fully_read_event().await;
         }
 
@@ -164,10 +179,10 @@ impl TimelineBuilder {
             span.follows_from(Span::current());
 
             async move {
-                trace!("Spawned the event subscriber task");
+                trace!("Spawned the event subscriber task.");
 
                 loop {
-                    trace!("Waiting for an event");
+                    trace!("Waiting for an event.");
 
                     let update = match event_subscriber.recv().await {
                         Ok(up) => up,
@@ -183,18 +198,28 @@ impl TimelineBuilder {
                     };
 
                     match update {
-                        RoomEventCacheUpdate::Clear => {
-                            trace!("Clearing the timeline.");
-                            inner.clear().await;
-                        }
-
                         RoomEventCacheUpdate::UpdateReadMarker { event_id } => {
                             trace!(target = %event_id, "Handling fully read marker.");
                             inner.handle_fully_read_marker(event_id).await;
                         }
 
+                        RoomEventCacheUpdate::Clear => {
+                            if inner.focus.kind.get() != TimelineFocus::Live {
+                                // Ignore live updates for a timeline not in live mode.
+                                continue;
+                            }
+
+                            trace!("Clearing the timeline.");
+                            inner.clear().await;
+                        }
+
                         RoomEventCacheUpdate::Append { events, ephemeral, ambiguity_changes } => {
-                            trace!("Received new events");
+                            if inner.focus.kind.get() != TimelineFocus::Live {
+                                // Ignore live updates for a timeline not in live mode.
+                                continue;
+                            }
+
+                            trace!("Received new events from sync.");
 
                             // TODO: (bnjbvr) ephemeral should be handled by the event cache, and
                             // we should replace this with a simple `add_events_at`.
@@ -283,7 +308,6 @@ impl TimelineBuilder {
 
         let timeline = Timeline {
             inner,
-            back_pagination_status: SharedObservable::new(BackPaginationStatus::Idle),
             msg_sender,
             event_cache: room_event_cache,
             drop_handle: Arc::new(TimelineDropHandle {
@@ -297,7 +321,7 @@ impl TimelineBuilder {
         };
 
         #[cfg(feature = "e2e-encryption")]
-        if has_events {
+        if has_initial_events {
             // The events we're injecting might be encrypted events, but we might
             // have received the room key to decrypt them while nobody was listening to the
             // `m.room_key` event, let's retry now.

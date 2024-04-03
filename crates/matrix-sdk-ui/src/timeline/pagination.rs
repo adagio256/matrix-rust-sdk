@@ -19,6 +19,15 @@ use tracing::{instrument, trace, warn};
 
 use crate::timeline::inner::TimelineEnd;
 
+#[derive(Debug, thiserror::Error)]
+enum TimelineBackpaginationError {
+    #[error("The timeline isn't in live mode")]
+    NonLiveMode,
+
+    #[error("Error in event cache: {0}")]
+    EventCache(#[source] event_cache::EventCacheError),
+}
+
 impl super::Timeline {
     /// Add more events to the start of the timeline.
     #[instrument(skip_all, fields(room_id = ?self.room().room_id(), ?options))]
@@ -26,12 +35,14 @@ impl super::Timeline {
         &self,
         mut options: PaginationOptions<'_>,
     ) -> event_cache::Result<()> {
-        if self.back_pagination_status.get() == BackPaginationStatus::TimelineStartReached {
+        let back_pagination_status = &self.inner.focus.back_pagination_status;
+
+        if back_pagination_status.get() == BackPaginationStatus::TimelineStartReached {
             warn!("Start of timeline reached, ignoring backwards-pagination request");
             return Ok(());
         }
 
-        if self.back_pagination_status.set_if_not_eq(BackPaginationStatus::Paginating).is_none() {
+        if back_pagination_status.set_if_not_eq(BackPaginationStatus::Paginating).is_none() {
             warn!("Another back-pagination is already running in the background");
             return Ok(());
         }
@@ -57,7 +68,7 @@ impl super::Timeline {
                             self.inner.add_events_at(events, TimelineEnd::Front).await;
 
                         if reached_start {
-                            self.back_pagination_status
+                            back_pagination_status
                                 .set_if_not_eq(BackPaginationStatus::TimelineStartReached);
                             return Ok(());
                         }
@@ -95,7 +106,7 @@ impl super::Timeline {
             }
         }
 
-        self.back_pagination_status.set_if_not_eq(BackPaginationStatus::Idle);
+        back_pagination_status.set_if_not_eq(BackPaginationStatus::Idle);
         Ok(())
     }
 }
