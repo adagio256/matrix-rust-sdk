@@ -12,59 +12,199 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::BTreeMap;
+use std::{fmt, iter::once};
 
-use async_trait::async_trait;
-use matrix_sdk_base::deserialized_responses::SyncTimelineEvent;
-use ruma::{OwnedRoomId, RoomId};
-use tokio::sync::RwLock;
+use matrix_sdk_common::deserialized_responses::SyncTimelineEvent;
 
-use super::Result;
+use super::linked_chunk::{
+    Chunk, ChunkIdentifier, LinkedChunk, LinkedChunkError, LinkedChunkIter,
+    LinkedChunkIterBackward, Position,
+};
 
-/// A store that can be remember information about the event cache.
-///
-/// It really acts as a cache, in the sense that clearing the backing data
-/// should not have any irremediable effect, other than providing a lesser user
-/// experience.
-#[async_trait]
-pub trait EventCacheStore: Send + Sync {
-    /// Returns all the known events for the given room.
-    async fn room_events(&self, room: &RoomId) -> Result<Vec<SyncTimelineEvent>>;
+/// A newtype wrapper for a pagination token returned by a /messages response.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PaginationToken(pub String);
 
-    /// Adds all the events to the given room.
-    async fn add_room_events(&self, room: &RoomId, events: Vec<SyncTimelineEvent>) -> Result<()>;
-
-    /// Clear all the events from the given room.
-    async fn clear_room_events(&self, room: &RoomId) -> Result<()>;
+#[derive(Debug)]
+pub struct Gap {
+    /// The token to use in the query, extracted from a previous "from" /
+    /// "end" field of a `/messages` response.
+    pub prev_token: PaginationToken,
 }
 
-/// An [`EventCacheStore`] implementation that keeps all the information in
-/// memory.
-pub(crate) struct MemoryStore {
-    /// All the events per room, in sync order.
-    by_room: RwLock<BTreeMap<OwnedRoomId, Vec<SyncTimelineEvent>>>,
+const DEFAULT_CHUNK_CAPACITY: usize = 128;
+
+pub struct RoomEvents {
+    chunks: LinkedChunk<SyncTimelineEvent, Gap, DEFAULT_CHUNK_CAPACITY>,
 }
 
-impl MemoryStore {
-    /// Create a new empty [`MemoryStore`].
+impl Default for RoomEvents {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[allow(dead_code)]
+impl RoomEvents {
     pub fn new() -> Self {
-        Self { by_room: Default::default() }
+        Self { chunks: LinkedChunk::new() }
+    }
+
+    /// Clear all events.
+    pub fn reset(&mut self) {
+        self.chunks = LinkedChunk::new();
+    }
+
+    /// Return the number of events.
+    pub fn len(&self) -> usize {
+        self.chunks.len()
+    }
+
+    /// Push one event after existing events.
+    pub fn push_event(&mut self, event: SyncTimelineEvent) {
+        self.push_events(once(event))
+    }
+
+    /// Push events after all events or gaps.
+    ///
+    /// The last event in `events` is the most recent one.
+    pub fn push_events<I>(&mut self, events: I)
+    where
+        I: IntoIterator<Item = SyncTimelineEvent>,
+        I::IntoIter: ExactSizeIterator,
+    {
+        self.chunks.push_items_back(events)
+    }
+
+    /// Push a gap after all events or gaps.
+    pub fn push_gap(&mut self, gap: Gap) {
+        self.chunks.push_gap_back(gap)
+    }
+
+    /// Insert events at a specified position.
+    pub fn insert_events_at<I>(
+        &mut self,
+        events: I,
+        position: Position,
+    ) -> Result<(), LinkedChunkError>
+    where
+        I: IntoIterator<Item = SyncTimelineEvent>,
+        I::IntoIter: ExactSizeIterator,
+    {
+        self.chunks.insert_items_at(events, position)
+    }
+
+    /// Insert a gap at a specified position.
+    pub fn insert_gap_at(&mut self, gap: Gap, position: Position) -> Result<(), LinkedChunkError> {
+        self.chunks.insert_gap_at(gap, position)
+    }
+
+    /// Replace the gap identified by `gap_identifier`, by events.
+    ///
+    /// Because the `gap_identifier` can represent non-gap chunk, this method
+    /// returns a `Result`.
+    ///
+    /// This method returns a reference to the (first if many) newly created
+    /// `Chunk` that contains the `items`.
+    pub fn replace_gap_at<I>(
+        &mut self,
+        events: I,
+        gap_identifier: ChunkIdentifier,
+    ) -> Result<&Chunk<SyncTimelineEvent, Gap, DEFAULT_CHUNK_CAPACITY>, LinkedChunkError>
+    where
+        I: IntoIterator<Item = SyncTimelineEvent>,
+        I::IntoIter: ExactSizeIterator,
+    {
+        self.chunks.replace_gap_at(events, gap_identifier)
+    }
+
+    /// Search for a chunk, and return its identifier.
+    pub fn chunk_identifier<'a, P>(&'a self, predicate: P) -> Option<ChunkIdentifier>
+    where
+        P: FnMut(&'a Chunk<SyncTimelineEvent, Gap, DEFAULT_CHUNK_CAPACITY>) -> bool,
+    {
+        self.chunks.chunk_identifier(predicate)
+    }
+
+    /// Search for an item, and return its position.
+    pub fn event_position<'a, P>(&'a self, predicate: P) -> Option<Position>
+    where
+        P: FnMut(&'a SyncTimelineEvent) -> bool,
+    {
+        self.chunks.item_position(predicate)
+    }
+
+    /// Iterate over the chunks, backward.
+    ///
+    /// The most recent chunk comes first.
+    pub fn rchunks(
+        &self,
+    ) -> LinkedChunkIterBackward<'_, SyncTimelineEvent, Gap, DEFAULT_CHUNK_CAPACITY> {
+        self.chunks.rchunks()
+    }
+
+    /// Iterate over the chunks, forward.
+    ///
+    /// The oldest chunk comes first.
+    pub fn chunks(&self) -> LinkedChunkIter<'_, SyncTimelineEvent, Gap, DEFAULT_CHUNK_CAPACITY> {
+        self.chunks.chunks()
+    }
+
+    /// Iterate over the chunks, starting from `identifier`, backward.
+    pub fn rchunks_from(
+        &self,
+        identifier: ChunkIdentifier,
+    ) -> Result<
+        LinkedChunkIterBackward<'_, SyncTimelineEvent, Gap, DEFAULT_CHUNK_CAPACITY>,
+        LinkedChunkError,
+    > {
+        self.chunks.rchunks_from(identifier)
+    }
+
+    /// Iterate over the chunks, starting from `identifier`, forward — i.e.
+    /// to the latest chunk.
+    pub fn chunks_from(
+        &self,
+        identifier: ChunkIdentifier,
+    ) -> Result<LinkedChunkIter<'_, SyncTimelineEvent, Gap, DEFAULT_CHUNK_CAPACITY>, LinkedChunkError>
+    {
+        self.chunks.chunks_from(identifier)
+    }
+
+    /// Iterate over the events, backward.
+    ///
+    /// The most recent event comes first.
+    pub fn revents(&self) -> impl Iterator<Item = (Position, &SyncTimelineEvent)> {
+        self.chunks.ritems()
+    }
+
+    /// Iterate over the events, forward.
+    ///
+    /// The oldest event comes first.
+    pub fn events(&self) -> impl Iterator<Item = (Position, &SyncTimelineEvent)> {
+        self.chunks.items()
+    }
+
+    /// Iterate over the events, starting from `position`, backward.
+    pub fn revents_from(
+        &self,
+        position: Position,
+    ) -> Result<impl Iterator<Item = (Position, &SyncTimelineEvent)>, LinkedChunkError> {
+        self.chunks.ritems_from(position)
+    }
+
+    /// Iterate over the events, starting from `position`, forward — i.e.
+    /// to the latest event.
+    pub fn events_from(
+        &self,
+        position: Position,
+    ) -> Result<impl Iterator<Item = (Position, &SyncTimelineEvent)>, LinkedChunkError> {
+        self.chunks.items_from(position)
     }
 }
 
-#[async_trait]
-impl EventCacheStore for MemoryStore {
-    async fn room_events(&self, room: &RoomId) -> Result<Vec<SyncTimelineEvent>> {
-        Ok(self.by_room.read().await.get(room).cloned().unwrap_or_default())
-    }
-
-    async fn add_room_events(&self, room: &RoomId, events: Vec<SyncTimelineEvent>) -> Result<()> {
-        self.by_room.write().await.entry(room.to_owned()).or_default().extend(events);
-        Ok(())
-    }
-
-    async fn clear_room_events(&self, room: &RoomId) -> Result<()> {
-        let _ = self.by_room.write().await.remove(room);
-        Ok(())
+impl fmt::Debug for RoomEvents {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
+        formatter.debug_struct("RoomEvents").field("chunk", &self.chunks).finish()
     }
 }

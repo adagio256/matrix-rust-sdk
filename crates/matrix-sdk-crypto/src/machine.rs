@@ -40,8 +40,8 @@ use ruma::{
         AnyToDeviceEvent, MessageLikeEventContent,
     },
     serde::Raw,
-    DeviceId, DeviceKeyAlgorithm, OwnedDeviceId, OwnedDeviceKeyId, OwnedTransactionId, OwnedUserId,
-    RoomId, TransactionId, UInt, UserId,
+    DeviceId, DeviceKeyAlgorithm, MilliSecondsSinceUnixEpoch, OwnedDeviceId, OwnedDeviceKeyId,
+    OwnedTransactionId, OwnedUserId, RoomId, TransactionId, UInt, UserId,
 };
 use serde_json::value::to_raw_value;
 use tokio::sync::Mutex;
@@ -344,6 +344,16 @@ impl OlmMachine {
     /// The unique device ID that identifies this `OlmMachine`.
     pub fn device_id(&self) -> &DeviceId {
         &self.inner.device_id
+    }
+
+    /// The time at which the `Account` backing this `OlmMachine` was created.
+    ///
+    /// An [`Account`] is created when an `OlmMachine` is first instantiated
+    /// against a given [`Store`], at which point it creates identity keys etc.
+    /// This method returns the timestamp, according to the local clock, at
+    /// which that happened.
+    pub fn device_creation_time(&self) -> MilliSecondsSinceUnixEpoch {
+        self.inner.store.static_account().creation_local_time()
     }
 
     /// Get the public parts of our Olm identity keys.
@@ -1927,6 +1937,8 @@ impl OlmMachine {
             None => 0,
         };
 
+        tracing::debug!("Initialising crypto store generation at {}", gen);
+
         self.inner
             .store
             .set_custom_value(Self::CURRENT_GENERATION_STORE_KEY, gen.to_le_bytes().to_vec())
@@ -1939,19 +1951,32 @@ impl OlmMachine {
 
     /// If needs be, update the local and on-disk crypto store generation.
     ///
-    /// Returns true whether another user has modified the internal generation
-    /// counter, and as such we've incremented and updated it in the
-    /// database.
-    ///
     /// ## Requirements
     ///
     /// - This assumes that `initialize_crypto_store_generation` has been called
     /// beforehand.
     /// - This requires that the crypto store lock has been acquired.
-    pub async fn maintain_crypto_store_generation(
-        &self,
+    ///
+    /// # Arguments
+    ///
+    /// * `generation` - The in-memory generation counter (or rather, the
+    ///   `Mutex` wrapping it). This defines the "expected" generation on entry,
+    ///   and, if we determine an update is needed, is updated to hold the "new"
+    ///   generation.
+    ///
+    /// # Returns
+    ///
+    /// A tuple containing:
+    ///
+    /// * A `bool`, set to `true` if another process has updated the generation
+    ///   number in the `Store` since our expected value, and as such we've
+    ///   incremented and updated it in the database. Otherwise, `false`.
+    ///
+    /// * The (possibly updated) generation counter.
+    pub async fn maintain_crypto_store_generation<'a>(
+        &'a self,
         generation: &Mutex<Option<u64>>,
-    ) -> StoreResult<bool> {
+    ) -> StoreResult<(bool, u64)> {
         let mut gen_guard = generation.lock().await;
 
         // The database value must be there:
@@ -1973,10 +1998,10 @@ impl OlmMachine {
                 CryptoStoreError::InvalidLockGeneration("invalid format".to_owned())
             })?);
 
-        let expected_gen = match gen_guard.as_ref() {
+        let new_gen = match gen_guard.as_ref() {
             Some(expected_gen) => {
                 if actual_gen == *expected_gen {
-                    return Ok(false);
+                    return Ok((false, actual_gen));
                 }
                 // Increment the biggest, and store it everywhere.
                 actual_gen.max(*expected_gen).wrapping_add(1)
@@ -1992,22 +2017,19 @@ impl OlmMachine {
             "Crypto store generation mismatch: previously known was {:?}, actual is {:?}, next is {}",
             *gen_guard,
             actual_gen,
-            expected_gen
+            new_gen
         );
 
         // Update known value.
-        *gen_guard = Some(expected_gen);
+        *gen_guard = Some(new_gen);
 
         // Update value in database.
         self.inner
             .store
-            .set_custom_value(
-                Self::CURRENT_GENERATION_STORE_KEY,
-                expected_gen.to_le_bytes().to_vec(),
-            )
+            .set_custom_value(Self::CURRENT_GENERATION_STORE_KEY, new_gen.to_le_bytes().to_vec())
             .await?;
 
-        Ok(true)
+        Ok((true, new_gen))
     }
 
     /// Manage dehydrated devices.
@@ -2157,8 +2179,8 @@ pub struct EncryptionSyncChanges<'a> {
 }
 
 #[cfg(any(feature = "testing", test))]
+#[allow(dead_code)]
 pub(crate) mod testing {
-    #![allow(dead_code)]
     use http::Response;
 
     pub fn response_from_file(json: &serde_json::Value) -> Response<Vec<u8>> {
@@ -2293,7 +2315,7 @@ pub(crate) mod tests {
             .store()
             .with_transaction(|mut tr| async {
                 let account = tr.account().await.unwrap();
-                account.generate_fallback_key_helper();
+                account.generate_fallback_key_if_needed();
                 account.update_uploaded_key_count(0);
                 account.generate_one_time_keys_if_needed();
                 let request = machine
@@ -2398,7 +2420,12 @@ pub(crate) mod tests {
 
     #[async_test]
     async fn test_create_olm_machine() {
+        let test_start_ts = MilliSecondsSinceUnixEpoch::now();
         let machine = OlmMachine::new(user_id(), alice_device_id()).await;
+
+        let device_creation_time = machine.device_creation_time();
+        assert!(device_creation_time <= MilliSecondsSinceUnixEpoch::now());
+        assert!(device_creation_time >= test_start_ts);
 
         let cache = machine.store().cache().await.unwrap();
         let account = cache.account().await.unwrap();

@@ -31,8 +31,9 @@
 //! - [ ] expose that information with a new data structure similar to the
 //!   `RoomInfo`, and that may update a `RoomListService`.
 //! - [ ] provide read receipts for each message.
-//! - [ ] backwards and forward pagination, and reconcile results with cached
-//!   timelines.
+//! - [x] backwards pagination
+//! - [ ] forward pagination
+//! - [ ] reconcile results with cached timelines.
 //! - [ ] retry decryption upon receiving new keys (from an encryption sync
 //!   service or from a key backup).
 //! - [ ] expose the latest event for a given room.
@@ -44,27 +45,36 @@ use std::{
     collections::BTreeMap,
     fmt::Debug,
     sync::{Arc, OnceLock, Weak},
+    time::Duration,
 };
 
 use matrix_sdk_base::{
-    deserialized_responses::{AmbiguityChange, SyncTimelineEvent},
+    deserialized_responses::{AmbiguityChange, SyncTimelineEvent, TimelineEvent},
     sync::{JoinedRoomUpdate, LeftRoomUpdate, RoomUpdates, Timeline},
 };
 use matrix_sdk_common::executor::{spawn, JoinHandle};
 use ruma::{
+    assign,
     events::{AnyRoomAccountDataEvent, AnySyncEphemeralRoomEvent},
     serde::Raw,
     OwnedEventId, OwnedRoomId, RoomId,
 };
-use tokio::sync::{
-    broadcast::{error::RecvError, Receiver, Sender},
-    Mutex, RwLock,
+use tokio::{
+    sync::{
+        broadcast::{error::RecvError, Receiver, Sender},
+        Mutex, Notify, RwLock, RwLockReadGuard, RwLockWriteGuard,
+    },
+    time::timeout,
 };
 use tracing::{error, instrument, trace, warn};
 
-use self::store::{EventCacheStore, MemoryStore};
-use crate::{client::ClientInner, Client, Room};
+use self::{
+    linked_chunk::ChunkContent,
+    store::{Gap, PaginationToken, RoomEvents},
+};
+use crate::{client::ClientInner, room::MessagesOptions, Client, Room};
 
+mod linked_chunk;
 mod store;
 
 /// An error observed in the [`EventCache`].
@@ -77,11 +87,27 @@ pub enum EventCacheError {
     )]
     NotSubscribedYet,
 
+    /// The room hasn't been found in the client.
+    ///
+    /// Technically, it's possible to request a `RoomEventCache` for a room that
+    /// is not known to the client, leading to this error.
+    #[error("Room {0} hasn't been found in the Client.")]
+    RoomNotFound(OwnedRoomId),
+
+    /// The given back-pagination token is unknown to the event cache.
+    #[error("The given back-pagination token is unknown to the event cache.")]
+    UnknownBackpaginationToken,
+
     /// The [`EventCache`] owns a weak reference to the [`Client`] it pertains
     /// to. It's possible this weak reference points to nothing anymore, at
     /// times where we try to use the client.
     #[error("The owning client of the event cache has been dropped.")]
     ClientDropped,
+
+    /// Another error caused by the SDK happened somewhere, and we report it to
+    /// the caller.
+    #[error("SDK error: {0}")]
+    SdkError(#[source] crate::Error),
 }
 
 /// A result using the [`EventCacheError`].
@@ -89,6 +115,7 @@ pub type Result<T> = std::result::Result<T, EventCacheError>;
 
 /// Hold handles to the tasks spawn by a [`RoomEventCache`].
 pub struct EventCacheDropHandles {
+    /// Task that listens to room updates.
     listen_updates_task: JoinHandle<()>,
 }
 
@@ -124,15 +151,14 @@ impl Debug for EventCache {
 impl EventCache {
     /// Create a new [`EventCache`] for the given client.
     pub(crate) fn new(client: &Arc<ClientInner>) -> Self {
-        let store = Arc::new(MemoryStore::new());
-        let inner = Arc::new(EventCacheInner {
-            client: Arc::downgrade(client),
-            by_room: Default::default(),
-            store: Arc::new(Mutex::new(store)),
-            drop_handles: Default::default(),
-        });
-
-        Self { inner }
+        Self {
+            inner: Arc::new(EventCacheInner {
+                client: Arc::downgrade(client),
+                multiple_room_updates_lock: Default::default(),
+                by_room: Default::default(),
+                drop_handles: Default::default(),
+            }),
+        }
     }
 
     /// Starts subscribing the [`EventCache`] to sync responses, if not done
@@ -155,6 +181,7 @@ impl EventCache {
         Ok(())
     }
 
+    #[instrument(skip_all)]
     async fn listen_task(
         inner: Arc<EventCacheInner>,
         mut room_updates_feed: Receiver<RoomUpdates>,
@@ -176,18 +203,24 @@ impl EventCache {
                     }
                 }
 
-                Err(RecvError::Lagged(_)) => {
+                Err(RecvError::Lagged(num_skipped)) => {
                     // Forget everything we know; we could have missed events, and we have
                     // no way to reconcile at the moment!
                     // TODO: implement Smart Matching™,
-                    let store = inner.store.lock().await;
-                    let mut by_room = inner.by_room.write().await;
-                    for room_id in by_room.keys() {
-                        if let Err(err) = store.clear_room_events(room_id).await {
-                            error!("unable to clear room after room updates lag: {err}");
-                        }
+                    warn!(num_skipped, "Lagged behind room updates, clearing all rooms");
+
+                    // Note: one must NOT clear the `by_room` map, because if something subscribed
+                    // to a room update, they would never get any new update for that room, since
+                    // re-creating the `RoomEventCache` would create a new unrelated sender.
+
+                    let rooms = inner.by_room.write().await;
+                    for room in rooms.values() {
+                        // Notify all the observers that we've lost track of state. (We ignore the
+                        // error if there aren't any.)
+                        let _ = room.inner.sender.send(RoomEventCacheUpdate::Clear);
+                        // Clear all the events in memory.
+                        room.inner.events.write().await.reset();
                     }
-                    by_room.clear();
                 }
 
                 Err(RecvError::Closed) => {
@@ -221,6 +254,7 @@ impl EventCache {
         &self,
         room_id: &RoomId,
         events: Vec<SyncTimelineEvent>,
+        prev_batch: Option<String>,
     ) -> Result<()> {
         let Some(room_cache) = self.inner.for_room(room_id).await? else {
             warn!("unknown room, skipping");
@@ -230,12 +264,11 @@ impl EventCache {
         // We could have received events during a previous sync; remove them all, since
         // we can't know where to insert the "initial events" with respect to
         // them.
-        let store = self.inner.store.lock().await;
 
-        store.clear_room_events(room_id).await?;
-        let _ = room_cache.inner.sender.send(RoomEventCacheUpdate::Clear);
-
-        room_cache.inner.append_events(&**store, events).await?;
+        room_cache
+            .inner
+            .replace_all_events_by(events, prev_batch, Default::default(), Default::default())
+            .await?;
 
         Ok(())
     }
@@ -246,17 +279,16 @@ struct EventCacheInner {
     /// on the owning client.
     client: Weak<ClientInner>,
 
-    /// Lazily-filled cache of live [`RoomEventCache`], once per room.
-    by_room: RwLock<BTreeMap<OwnedRoomId, RoomEventCache>>,
-
-    /// Backend used for storage.
+    /// A lock used when many rooms must be updated at once.
     ///
     /// [`Mutex`] is “fair”, as it is implemented as a FIFO. It is important to
     /// ensure that multiple updates will be applied in the correct order, which
-    /// is enforced by taking the store lock when handling an update.
-    ///
-    /// TODO: replace with a cross-process lock
-    store: Arc<Mutex<Arc<dyn EventCacheStore>>>,
+    /// is enforced by taking this lock when handling an update.
+    // TODO: that's the place to add a cross-process lock!
+    multiple_room_updates_lock: Mutex<()>,
+
+    /// Lazily-filled cache of live [`RoomEventCache`], once per room.
+    by_room: RwLock<BTreeMap<OwnedRoomId, RoomEventCache>>,
 
     /// Handles to keep alive the task listening to updates.
     drop_handles: OnceLock<Arc<EventCacheDropHandles>>,
@@ -272,7 +304,7 @@ impl EventCacheInner {
     async fn handle_room_updates(&self, updates: RoomUpdates) -> Result<()> {
         // First, take the lock that indicates we're processing updates, to avoid
         // handling multiple updates concurrently.
-        let store = self.store.lock().await;
+        let _lock = self.multiple_room_updates_lock.lock().await;
 
         // Left rooms.
         for (room_id, left_room_update) in updates.leave {
@@ -281,7 +313,7 @@ impl EventCacheInner {
                 continue;
             };
 
-            if let Err(err) = room.inner.handle_left_room_update(&**store, left_room_update).await {
+            if let Err(err) = room.inner.handle_left_room_update(left_room_update).await {
                 // Non-fatal error, try to continue to the next room.
                 error!("handling left room update: {err}");
             }
@@ -294,9 +326,7 @@ impl EventCacheInner {
                 continue;
             };
 
-            if let Err(err) =
-                room.inner.handle_joined_room_update(&**store, joined_room_update).await
-            {
+            if let Err(err) = room.inner.handle_joined_room_update(joined_room_update).await {
                 // Non-fatal error, try to continue to the next room.
                 error!("handling joined room update: {err}");
             }
@@ -335,7 +365,7 @@ impl EventCacheInner {
                     return Ok(None);
                 };
 
-                let room_event_cache = RoomEventCache::new(room, self.store.clone());
+                let room_event_cache = RoomEventCache::new(room);
 
                 by_room_guard.insert(room_id.to_owned(), room_event_cache.clone());
 
@@ -361,8 +391,8 @@ impl Debug for RoomEventCache {
 
 impl RoomEventCache {
     /// Create a new [`RoomEventCache`] using the given room and store.
-    fn new(room: Room, store: Arc<Mutex<Arc<dyn EventCacheStore>>>) -> Self {
-        Self { inner: Arc::new(RoomEventCacheInner::new(room, store)) }
+    fn new(room: Room) -> Self {
+        Self { inner: Arc::new(RoomEventCacheInner::new(room)) }
     }
 
     /// Subscribe to room updates for this room, after getting the initial list
@@ -372,9 +402,38 @@ impl RoomEventCache {
     pub async fn subscribe(
         &self,
     ) -> Result<(Vec<SyncTimelineEvent>, Receiver<RoomEventCacheUpdate>)> {
-        let store = self.inner.store.lock().await;
+        let events =
+            self.inner.events.read().await.events().map(|(_position, item)| item.clone()).collect();
 
-        Ok((store.room_events(self.inner.room.room_id()).await?, self.inner.sender.subscribe()))
+        Ok((events, self.inner.sender.subscribe()))
+    }
+
+    /// Returns the oldest back-pagination token, that is, the one closest to
+    /// the beginning of the timeline as we know it.
+    ///
+    /// Optionally, wait at most for the given duration for a back-pagination
+    /// token to be returned by a sync.
+    pub async fn oldest_backpagination_token(
+        &self,
+        max_wait: Option<Duration>,
+    ) -> Result<Option<PaginationToken>> {
+        self.inner.oldest_backpagination_token(max_wait).await
+    }
+
+    /// Back-paginate with the given token, if provided.
+    ///
+    /// If no token has been provided, it will back-paginate from the end of the
+    /// room.
+    ///
+    /// If a token has been provided, but it was unknown to the event cache
+    /// (i.e. it's not associated to any gap in the timeline stored by the
+    /// event cache), then an error result will be returned.
+    pub async fn backpaginate(
+        &self,
+        batch_size: u16,
+        token: Option<PaginationToken>,
+    ) -> Result<BackPaginationOutcome> {
+        self.inner.backpaginate(batch_size, token).await
     }
 }
 
@@ -383,118 +442,395 @@ struct RoomEventCacheInner {
     /// Sender part for subscribers to this room.
     sender: Sender<RoomEventCacheUpdate>,
 
-    /// Backend used for storage, shared with the parent [`EventCacheInner`].
-    ///
-    /// See comment there.
-    store: Arc<Mutex<Arc<dyn EventCacheStore>>>,
-
     /// The Client [`Room`] this event cache pertains to.
     room: Room,
+
+    /// The events of the room.
+    events: RwLock<RoomEvents>,
+
+    /// A notifier that we received a new pagination token.
+    pagination_token_notifier: Notify,
+
+    /// A lock that ensures we don't run multiple pagination queries at the same
+    /// time.
+    pagination_lock: Mutex<()>,
 }
 
 impl RoomEventCacheInner {
     /// Creates a new cache for a room, and subscribes to room updates, so as
     /// to handle new timeline events.
-    fn new(room: Room, store: Arc<Mutex<Arc<dyn EventCacheStore>>>) -> Self {
-        let sender = Sender::new(32);
-        Self { room, store, sender }
+    fn new(room: Room) -> Self {
+        let sender = Sender::new(128);
+
+        Self {
+            room,
+            events: RwLock::new(RoomEvents::default()),
+            sender,
+            pagination_lock: Default::default(),
+            pagination_token_notifier: Default::default(),
+        }
     }
 
-    async fn handle_joined_room_update(
-        &self,
-        store: &dyn EventCacheStore,
-        updates: JoinedRoomUpdate,
-    ) -> Result<()> {
+    fn handle_account_data(&self, account_data: Vec<Raw<AnyRoomAccountDataEvent>>) {
+        trace!("Handling account data");
+        for raw_event in account_data {
+            match raw_event.deserialize() {
+                Ok(AnyRoomAccountDataEvent::FullyRead(ev)) => {
+                    // Propagate to observers. (We ignore the error if there aren't any.)
+                    let _ = self.sender.send(RoomEventCacheUpdate::UpdateReadMarker {
+                        event_id: ev.content.event_id,
+                    });
+                }
+
+                Ok(_) => {
+                    // We're not interested in other room account data updates,
+                    // at this point.
+                }
+
+                Err(e) => {
+                    let event_type = raw_event.get_field::<String>("type").ok().flatten();
+                    warn!(event_type, "Failed to deserialize account data: {e}");
+                }
+            }
+        }
+    }
+
+    async fn handle_joined_room_update(&self, updates: JoinedRoomUpdate) -> Result<()> {
         self.handle_timeline(
-            store,
             updates.timeline,
             updates.ephemeral.clone(),
-            updates.account_data,
             updates.ambiguity_changes,
         )
         .await?;
+
+        self.handle_account_data(updates.account_data);
+
         Ok(())
     }
 
     async fn handle_timeline(
         &self,
-        store: &dyn EventCacheStore,
         timeline: Timeline,
         ephemeral: Vec<Raw<AnySyncEphemeralRoomEvent>>,
-        account_data: Vec<Raw<AnyRoomAccountDataEvent>>,
         ambiguity_changes: BTreeMap<OwnedEventId, AmbiguityChange>,
     ) -> Result<()> {
         if timeline.limited {
             // Ideally we'd try to reconcile existing events against those received in the
             // timeline, but we're not there yet. In the meanwhile, clear the
             // items from the room. TODO: implement Smart Matching™.
-            trace!("limited timeline, clearing all previous events");
-            store.clear_room_events(self.room.room_id()).await?;
-            let _ = self.sender.send(RoomEventCacheUpdate::Clear);
-        }
+            trace!("limited timeline, clearing all previous events and pushing new events");
 
-        // Add all the events to the backend.
-        if !timeline.events.is_empty()
-            || timeline.prev_batch.is_some()
-            || !ephemeral.is_empty()
-            || !account_data.is_empty()
-            || !ambiguity_changes.is_empty()
-        {
-            trace!("adding new events");
-            store.add_room_events(self.room.room_id(), timeline.events.clone()).await?;
-
-            // Propagate events to observers.
-            let _ = self.sender.send(RoomEventCacheUpdate::Append {
-                events: timeline.events,
-                prev_batch: timeline.prev_batch,
+            self.replace_all_events_by(
+                timeline.events,
+                timeline.prev_batch,
                 ephemeral,
-                account_data,
                 ambiguity_changes,
-            });
+            )
+            .await?;
+        } else {
+            // Add all the events to the backend.
+            trace!("adding new events");
+
+            self.append_new_events(
+                timeline.events,
+                timeline.prev_batch,
+                ephemeral,
+                ambiguity_changes,
+            )
+            .await?;
         }
 
         Ok(())
     }
 
-    async fn handle_left_room_update(
-        &self,
-        store: &dyn EventCacheStore,
-        updates: LeftRoomUpdate,
-    ) -> Result<()> {
-        self.handle_timeline(
-            store,
-            updates.timeline,
-            Vec::new(),
-            Vec::new(),
-            updates.ambiguity_changes,
-        )
-        .await?;
+    async fn handle_left_room_update(&self, updates: LeftRoomUpdate) -> Result<()> {
+        self.handle_timeline(updates.timeline, Vec::new(), updates.ambiguity_changes).await?;
         Ok(())
+    }
+
+    /// Remove existing events, and append a set of events to the room cache and
+    /// storage, notifying observers.
+    async fn replace_all_events_by(
+        &self,
+        events: Vec<SyncTimelineEvent>,
+        prev_batch: Option<String>,
+        ephemeral: Vec<Raw<AnySyncEphemeralRoomEvent>>,
+        ambiguity_changes: BTreeMap<OwnedEventId, AmbiguityChange>,
+    ) -> Result<()> {
+        // Acquire the lock.
+        let mut room_events = self.events.write().await;
+
+        // Reset the events.
+        room_events.reset();
+
+        // Propagate to observers.
+        let _ = self.sender.send(RoomEventCacheUpdate::Clear);
+
+        // Push the new events.
+        self.append_events_locked_impl(
+            room_events,
+            events,
+            prev_batch,
+            ephemeral,
+            ambiguity_changes,
+        )
+        .await
     }
 
     /// Append a set of events to the room cache and storage, notifying
     /// observers.
-    async fn append_events(
+    async fn append_new_events(
         &self,
-        store: &dyn EventCacheStore,
         events: Vec<SyncTimelineEvent>,
+        prev_batch: Option<String>,
+        ephemeral: Vec<Raw<AnySyncEphemeralRoomEvent>>,
+        ambiguity_changes: BTreeMap<OwnedEventId, AmbiguityChange>,
     ) -> Result<()> {
-        if events.is_empty() {
+        self.append_events_locked_impl(
+            self.events.write().await,
+            events,
+            prev_batch,
+            ephemeral,
+            ambiguity_changes,
+        )
+        .await
+    }
+
+    /// Append a set of events, with an attached lock.
+    ///
+    /// If the lock `room_events` is `None`, one will be created.
+    ///
+    /// This is a private implementation. It must not be exposed publicly.
+    async fn append_events_locked_impl(
+        &self,
+        mut room_events: RwLockWriteGuard<'_, RoomEvents>,
+        events: Vec<SyncTimelineEvent>,
+        prev_batch: Option<String>,
+        ephemeral: Vec<Raw<AnySyncEphemeralRoomEvent>>,
+        ambiguity_changes: BTreeMap<OwnedEventId, AmbiguityChange>,
+    ) -> Result<()> {
+        if events.is_empty()
+            && prev_batch.is_none()
+            && ephemeral.is_empty()
+            && ambiguity_changes.is_empty()
+        {
             return Ok(());
         }
 
-        store.add_room_events(self.room.room_id(), events.clone()).await?;
+        // Add the previous back-pagination token (if present), followed by the timeline
+        // events themselves.
+        {
+            if let Some(prev_token) = &prev_batch {
+                room_events.push_gap(Gap { prev_token: PaginationToken(prev_token.clone()) });
+            }
 
-        let _ = self.sender.send(RoomEventCacheUpdate::Append {
-            events,
-            prev_batch: None,
-            account_data: Default::default(),
-            ephemeral: Default::default(),
-            ambiguity_changes: Default::default(),
-        });
+            room_events.push_events(events.clone().into_iter());
+        }
+
+        // Now that all events have been added, we can trigger the
+        // `pagination_token_notifier`.
+        if prev_batch.is_some() {
+            self.pagination_token_notifier.notify_one();
+        }
+
+        let _ =
+            self.sender.send(RoomEventCacheUpdate::Append { events, ephemeral, ambiguity_changes });
 
         Ok(())
     }
+
+    /// Run a single back-pagination `/messages` request.
+    ///
+    /// This will only run one request; since a backpagination may need to
+    /// continue, it's preferable to use [`Self::backpaginate_until`].
+    ///
+    /// Returns the number of messages received in this chunk.
+    #[instrument(skip(self))]
+    async fn backpaginate(
+        &self,
+        batch_size: u16,
+        token: Option<PaginationToken>,
+    ) -> Result<BackPaginationOutcome> {
+        // Make sure there's at most one back-pagination request.
+        let _guard = self.pagination_lock.lock().await;
+
+        // Get messages.
+        let messages = self
+            .room
+            .messages(assign!(MessagesOptions::backward(), {
+                from: token.as_ref().map(|token| token.0.clone()),
+                limit: batch_size.into()
+            }))
+            .await
+            .map_err(EventCacheError::SdkError)?;
+
+        // Make sure the `RoomEvents` isn't updated while we are saving events from
+        // backpagination.
+        let mut room_events = self.events.write().await;
+
+        // Check that the `token` exists if any.
+        let gap_identifier = if let Some(token) = token.as_ref() {
+            let gap_identifier = room_events.chunk_identifier(|chunk| {
+                matches!(chunk.content(), ChunkContent::Gap(Gap { ref prev_token }) if prev_token == token)
+            });
+
+            // The method has been called with `token` but it doesn't exist in `RoomEvents`,
+            // it's an error.
+            if gap_identifier.is_none() {
+                return Ok(BackPaginationOutcome::UnknownBackpaginationToken);
+            }
+
+            gap_identifier
+        } else {
+            None
+        };
+
+        // Would we want to backpaginate again, we'd start from the `end` token as the
+        // next `from` token.
+
+        let prev_token =
+            messages.end.map(|prev_token| Gap { prev_token: PaginationToken(prev_token) });
+
+        // If this token is missing, then we've reached the end of the timeline.
+        let reached_start = prev_token.is_none();
+
+        // Note: The chunk could be empty.
+        //
+        // If there's any event, they are presented in reverse order (i.e. the first one
+        // should be prepended first).
+        let events = messages.chunk;
+
+        let sync_events = events
+            .iter()
+            // Reverse the order of the events as `/messages` has been called with `dir=b`
+            // (backward). The `RoomEvents` API expects the first event to be the oldest.
+            .rev()
+            .cloned()
+            .map(SyncTimelineEvent::from);
+
+        // There is a `token`/gap, let's replace it by new events!
+        if let Some(gap_identifier) = gap_identifier {
+            let new_position = {
+                // Replace the gap by new events.
+                let new_chunk = room_events
+                    .replace_gap_at(sync_events, gap_identifier)
+                    // SAFETY: we are sure that `gap_identifier` represents a valid
+                    // `ChunkIdentifier` for a `Gap` chunk.
+                    .expect("The `gap_identifier` must represent a `Gap`");
+
+                new_chunk.first_position()
+            };
+
+            // And insert a new gap if there is any `prev_token`.
+            if let Some(prev_token_gap) = prev_token {
+                room_events
+                    .insert_gap_at(prev_token_gap, new_position)
+                    // SAFETY: we are sure that `new_position` represents a valid
+                    // `ChunkIdentifier` for an `Item` chunk.
+                    .expect("The `new_position` must represent an `Item`");
+            }
+
+            trace!("replaced gap with new events from backpagination");
+
+            // TODO: implement smarter reconciliation later
+            //let _ = self.sender.send(RoomEventCacheUpdate::Prepend { events });
+
+            return Ok(BackPaginationOutcome::Success { events, reached_start });
+        }
+
+        // There is no `token`/gap identifier. Let's assume we must prepend the new
+        // events.
+        let first_event_pos = room_events.events().next().map(|(item_pos, _)| item_pos);
+
+        match first_event_pos {
+            // Is there a first item? Insert at this position.
+            Some(first_event_pos) => {
+                if let Some(prev_token_gap) = prev_token {
+                    room_events
+                            .insert_gap_at(prev_token_gap, first_event_pos)
+                            // SAFETY: The `first_event_pos` can only be an `Item` chunk, it's
+                            // an invariant of `LinkedChunk`. Also, it can only represent a valid
+                            // `ChunkIdentifier` as the data structure isn't modified yet.
+                            .expect("`first_event_pos` must point to a valid `Item` chunk when inserting a gap");
+                }
+
+                room_events
+                        .insert_events_at(sync_events, first_event_pos)
+                        // SAFETY: The `first_event_pos` can only be an `Item` chunk, it's
+                        // an invariant of `LinkedChunk`. The chunk it points to has not been
+                        // removed.
+                        .expect("The `first_event_pos` must point to a valid `Item` chunk when inserting events");
+            }
+
+            // There is no first item. Let's simply push.
+            None => {
+                if let Some(prev_token_gap) = prev_token {
+                    room_events.push_gap(prev_token_gap);
+                }
+
+                room_events.push_events(sync_events);
+            }
+        }
+
+        Ok(BackPaginationOutcome::Success { events, reached_start })
+    }
+
+    /// Returns the oldest back-pagination token, that is, the one closest to
+    /// the start of the timeline as we know it.
+    ///
+    /// Optionally, wait at most for the given duration for a back-pagination
+    /// token to be returned by a sync.
+    async fn oldest_backpagination_token(
+        &self,
+        max_wait: Option<Duration>,
+    ) -> Result<Option<PaginationToken>> {
+        // Optimistically try to return the backpagination token immediately.
+        fn get_oldest(room_events: RwLockReadGuard<'_, RoomEvents>) -> Option<PaginationToken> {
+            room_events.chunks().find_map(|chunk| match chunk.content() {
+                ChunkContent::Gap(gap) => Some(gap.prev_token.clone()),
+                ChunkContent::Items(..) => None,
+            })
+        }
+
+        if let Some(token) = get_oldest(self.events.read().await) {
+            return Ok(Some(token));
+        }
+
+        let Some(max_wait) = max_wait else {
+            // We had no token and no time to wait, so… no tokens.
+            return Ok(None);
+        };
+
+        // Otherwise wait for a notification that we received a token.
+        // Timeouts are fine, per this function's contract.
+        let _ = timeout(max_wait, self.pagination_token_notifier.notified()).await;
+
+        Ok(get_oldest(self.events.read().await))
+    }
+}
+
+/// The result of a single back-pagination request.
+#[derive(Debug)]
+pub enum BackPaginationOutcome {
+    /// The back-pagination succeeded, and new events have been found.
+    Success {
+        /// Did the back-pagination reach the start of the timeline?
+        reached_start: bool,
+
+        /// All the events that have been returned in the back-pagination
+        /// request.
+        ///
+        /// Events are presented in reverse order: the first element of the vec,
+        /// if present, is the most "recent" event from the chunk (or
+        /// technically, the last one in the topological ordering).
+        ///
+        /// Note: they're not deduplicated (TODO: smart reconciliation).
+        events: Vec<TimelineEvent>,
+    },
+
+    /// The back-pagination token was unknown to the event cache, and the caller
+    /// must retry after obtaining a new back-pagination token.
+    UnknownBackpaginationToken,
 }
 
 /// An update related to events happened in a room.
@@ -502,16 +838,17 @@ impl RoomEventCacheInner {
 pub enum RoomEventCacheUpdate {
     /// The room has been cleared from events.
     Clear,
+
+    /// The fully read marker has moved to a different event.
+    UpdateReadMarker {
+        /// Event at which the read marker is now pointing.
+        event_id: OwnedEventId,
+    },
+
     /// The room has new events.
     Append {
-        /// All the new events that have been added to the room.
+        /// All the new events that have been added to the room's timeline.
         events: Vec<SyncTimelineEvent>,
-        /// XXX: this is temporary, until backpagination lives in the event
-        /// cache.
-        prev_batch: Option<String>,
-        /// XXX: this is temporary, until account data lives in the event cache
-        /// — or will it live there?
-        account_data: Vec<Raw<AnyRoomAccountDataEvent>>,
         /// XXX: this is temporary, until read receipts are handled in the event
         /// cache
         ephemeral: Vec<Raw<AnySyncEphemeralRoomEvent>>,
@@ -521,4 +858,249 @@ pub enum RoomEventCacheUpdate {
         /// details of the ambiguity change.
         ambiguity_changes: BTreeMap<OwnedEventId, AmbiguityChange>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use assert_matches2::assert_matches;
+    use matrix_sdk_common::executor::spawn;
+    use matrix_sdk_test::{async_test, sync_timeline_event};
+    use ruma::room_id;
+
+    use super::{BackPaginationOutcome, EventCacheError};
+    use crate::{event_cache::store::PaginationToken, test_utils::logged_in_client};
+
+    #[async_test]
+    async fn test_must_explicitly_subscribe() {
+        let client = logged_in_client(None).await;
+
+        let event_cache = client.event_cache();
+
+        // If I create a room event subscriber for a room before subscribing the event
+        // cache,
+        let room_id = room_id!("!omelette:fromage.fr");
+        let result = event_cache.for_room(room_id).await;
+
+        // Then it fails, because one must explicitly call `.subscribe()` on the event
+        // cache.
+        assert_matches!(result, Err(EventCacheError::NotSubscribedYet));
+    }
+
+    // Those tests require time to work, and it does not on wasm32.
+    #[cfg(not(target_arch = "wasm32"))]
+    mod time_tests {
+        use std::time::{Duration, Instant};
+
+        use matrix_sdk_base::RoomState;
+        use serde_json::json;
+        use tokio::time::sleep;
+        use wiremock::{
+            matchers::{header, method, path_regex, query_param},
+            Mock, ResponseTemplate,
+        };
+
+        use super::{super::store::Gap, *};
+        use crate::test_utils::logged_in_client_with_server;
+
+        #[async_test]
+        async fn test_unknown_pagination_token() {
+            let (client, server) = logged_in_client_with_server().await;
+
+            let room_id = room_id!("!galette:saucisse.bzh");
+            client.base_client().get_or_create_room(room_id, matrix_sdk_base::RoomState::Joined);
+
+            client.event_cache().subscribe().unwrap();
+
+            let (room_event_cache, _drop_handles) =
+                client.event_cache().for_room(room_id).await.unwrap();
+            let room_event_cache = room_event_cache.unwrap();
+
+            // If I try to back-paginate with an unknown back-pagination token,
+            let token_name = "unknown";
+            let token = PaginationToken(token_name.to_owned());
+
+            // Then I run into an error.
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/_matrix/client/r0/rooms/.*/messages$"))
+                .and(header("authorization", "Bearer 1234"))
+                .and(query_param("from", token_name))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "start": token_name,
+                    "chunk": [],
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let res = room_event_cache.backpaginate(20, Some(token)).await;
+            assert_matches!(res, Ok(BackPaginationOutcome::UnknownBackpaginationToken));
+
+            server.verify().await
+        }
+
+        #[async_test]
+        async fn test_wait_no_pagination_token() {
+            let client = logged_in_client(None).await;
+            let room_id = room_id!("!galette:saucisse.bzh");
+            client.base_client().get_or_create_room(room_id, RoomState::Joined);
+
+            let event_cache = client.event_cache();
+
+            event_cache.subscribe().unwrap();
+
+            let (room_event_cache, _drop_handlers) = event_cache.for_room(room_id).await.unwrap();
+            let room_event_cache = room_event_cache.unwrap();
+
+            // When I only have events in a room,
+            {
+                let mut room_events = room_event_cache.inner.events.write().await;
+                room_events.push_events([sync_timeline_event!({
+                    "sender": "b@z.h",
+                    "type": "m.room.message",
+                    "event_id": "$ida",
+                    "origin_server_ts": 12344446,
+                    "content": { "body":"yolo", "msgtype": "m.text" },
+                })
+                .into()]);
+            }
+
+            // If I don't wait for the backpagination token,
+            let found = room_event_cache.oldest_backpagination_token(None).await.unwrap();
+            // Then I don't find it.
+            assert!(found.is_none());
+
+            // If I wait for a back-pagination token for 0 seconds,
+            let before = Instant::now();
+            let found = room_event_cache
+                .oldest_backpagination_token(Some(Duration::default()))
+                .await
+                .unwrap();
+            let waited = before.elapsed();
+            // then I don't get any,
+            assert!(found.is_none());
+            // and I haven't waited long.
+            assert!(waited.as_secs() < 1);
+
+            // If I wait for a back-pagination token for 1 second,
+            let before = Instant::now();
+            let found = room_event_cache
+                .oldest_backpagination_token(Some(Duration::from_secs(1)))
+                .await
+                .unwrap();
+            let waited = before.elapsed();
+            // then I still don't get any.
+            assert!(found.is_none());
+            // and I've waited a bit.
+            assert!(waited.as_secs() < 2);
+            assert!(waited.as_secs() >= 1);
+        }
+
+        #[async_test]
+        async fn test_wait_for_pagination_token_already_present() {
+            let client = logged_in_client(None).await;
+            let room_id = room_id!("!galette:saucisse.bzh");
+            client.base_client().get_or_create_room(room_id, matrix_sdk_base::RoomState::Joined);
+
+            let event_cache = client.event_cache();
+
+            event_cache.subscribe().unwrap();
+
+            let (room_event_cache, _drop_handlers) = event_cache.for_room(room_id).await.unwrap();
+            let room_event_cache = room_event_cache.unwrap();
+
+            let expected_token = PaginationToken("old".to_owned());
+
+            // When I have events and multiple gaps, in a room,
+            {
+                let mut room_events = room_event_cache.inner.events.write().await;
+                room_events.push_gap(Gap { prev_token: expected_token.clone() });
+                room_events.push_events([sync_timeline_event!({
+                    "sender": "b@z.h",
+                    "type": "m.room.message",
+                    "event_id": "$ida",
+                    "origin_server_ts": 12344446,
+                    "content": { "body":"yolo", "msgtype": "m.text" },
+                })
+                .into()]);
+            }
+
+            // If I don't wait for a back-pagination token,
+            let found = room_event_cache.oldest_backpagination_token(None).await.unwrap();
+            // Then I get it.
+            assert_eq!(found.as_ref(), Some(&expected_token));
+
+            // If I wait for a back-pagination token for 0 seconds,
+            let before = Instant::now();
+            let found = room_event_cache
+                .oldest_backpagination_token(Some(Duration::default()))
+                .await
+                .unwrap();
+            let waited = before.elapsed();
+            // then I do get one.
+            assert_eq!(found.as_ref(), Some(&expected_token));
+            // and I haven't waited long.
+            assert!(waited.as_millis() < 100);
+
+            // If I wait for a back-pagination token for 1 second,
+            let before = Instant::now();
+            let found = room_event_cache
+                .oldest_backpagination_token(Some(Duration::from_secs(1)))
+                .await
+                .unwrap();
+            let waited = before.elapsed();
+            // then I do get one.
+            assert_eq!(found.as_ref(), Some(&expected_token));
+            // and I haven't waited long.
+            assert!(waited.as_millis() < 100);
+        }
+
+        #[async_test]
+        async fn test_wait_for_late_pagination_token() {
+            let client = logged_in_client(None).await;
+            let room_id = room_id!("!galette:saucisse.bzh");
+            client.base_client().get_or_create_room(room_id, matrix_sdk_base::RoomState::Joined);
+
+            let event_cache = client.event_cache();
+
+            event_cache.subscribe().unwrap();
+
+            let (room_event_cache, _drop_handles) = event_cache.for_room(room_id).await.unwrap();
+            let room_event_cache = room_event_cache.unwrap();
+
+            let expected_token = PaginationToken("old".to_owned());
+
+            let before = Instant::now();
+            let cloned_expected_token = expected_token.clone();
+            let cloned_room_event_cache = room_event_cache.clone();
+            let insert_token_task = spawn(async move {
+                // If a backpagination token is inserted after 400 milliseconds,
+                sleep(Duration::from_millis(400)).await;
+
+                {
+                    let mut room_events = cloned_room_event_cache.inner.events.write().await;
+                    room_events.push_gap(Gap { prev_token: cloned_expected_token });
+                }
+            });
+
+            // Then first I don't get it (if I'm not waiting,)
+            let found = room_event_cache.oldest_backpagination_token(None).await.unwrap();
+            assert!(found.is_none());
+
+            // And if I wait for the back-pagination token for 600ms,
+            let found = room_event_cache
+                .oldest_backpagination_token(Some(Duration::from_millis(600)))
+                .await
+                .unwrap();
+            let waited = before.elapsed();
+
+            // then I do get one eventually.
+            assert_eq!(found.as_ref(), Some(&expected_token));
+            // and I have waited between ~400 and ~1000 milliseconds.
+            assert!(waited.as_secs() < 1);
+            assert!(waited.as_millis() >= 400);
+
+            // The task succeeded.
+            insert_token_task.await.unwrap();
+        }
+    }
 }

@@ -120,6 +120,30 @@ macro_rules! assert_timeline_stream {
         )
     };
 
+    // `prepend --- day divider ---`
+    ( @_ [ $stream:ident ] [ prepend --- day divider --- ; $( $rest:tt )* ] [ $( $accumulator:tt )* ] ) => {
+        assert_timeline_stream!(
+            @_
+            [ $stream ]
+            [ $( $rest )* ]
+            [
+                $( $accumulator )*
+                {
+                    assert_matches!(
+                        $stream.next().now_or_never(),
+                        Some(Some(VectorDiff::PushFront { value })) => {
+                            assert_matches!(
+                                &**value,
+                                TimelineItemKind::Virtual(VirtualTimelineItem::DayDivider(_)) => {}
+                            );
+                        }
+                    );
+                }
+            ]
+        )
+    };
+
+
     // `insert [$nth] "$event_id"`
     ( @_ [ $stream:ident ] [ insert [$index:literal] $event_id:literal ; $( $rest:tt )* ] [ $( $accumulator:tt )* ] ) => {
         assert_timeline_stream!(
@@ -258,14 +282,14 @@ async fn timeline_test_helper(
     // TODO: when the event cache handles its own cache, we can remove this.
     client
         .event_cache()
-        .add_initial_events(room_id, sliding_sync_room.timeline_queue().iter().cloned().collect())
+        .add_initial_events(
+            room_id,
+            sliding_sync_room.timeline_queue().iter().cloned().collect(),
+            sliding_sync_room.prev_batch(),
+        )
         .await?;
 
-    let timeline = Timeline::builder(&sdk_room)
-        .with_pagination_token(sliding_sync_room.prev_batch())
-        .track_read_marker_and_receipts()
-        .build()
-        .await?;
+    let timeline = Timeline::builder(&sdk_room).track_read_marker_and_receipts().build().await?;
 
     Ok(timeline.subscribe().await)
 }
@@ -316,10 +340,10 @@ async fn test_timeline_basic() -> Result<()> {
 
         assert_timeline_stream! {
             [timeline_stream]
-            --- day divider ---;
             append    "$x1:bar.org";
-            update[1] "$x1:bar.org";
+            update[0] "$x1:bar.org";
             append    "$x2:bar.org";
+            prepend   --- day divider ---;
         };
     }
 
@@ -362,12 +386,12 @@ async fn test_timeline_duplicated_events() -> Result<()> {
 
         assert_timeline_stream! {
             [timeline_stream]
-            --- day divider ---;
             append    "$x1:bar.org";
-            update[1] "$x1:bar.org";
+            update[0] "$x1:bar.org";
             append    "$x2:bar.org";
-            update[2] "$x2:bar.org";
+            update[1] "$x2:bar.org";
             append    "$x3:bar.org";
+            prepend    --- day divider ---;
         };
     }
 
@@ -440,10 +464,10 @@ async fn test_timeline_read_receipts_are_updated_live() -> Result<()> {
 
         assert_timeline_stream! {
             [timeline_stream]
-            --- day divider ---;
             append    "$x1:bar.org";
-            update[1] "$x1:bar.org";
+            update[0] "$x1:bar.org";
             append    "$x2:bar.org";
+            prepend   --- day divider ---;
         };
     }
 
