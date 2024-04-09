@@ -30,13 +30,14 @@ use matrix_sdk_ui::{
     room_list_service,
     sync_service::{self, SyncService},
     timeline::{
-        PaginationOptions, TimelineItem, TimelineItemContent, TimelineItemKind, VirtualTimelineItem,
+        PaginationOptions, TimelineFocus, TimelineItem, TimelineItemContent, TimelineItemKind,
+        VirtualTimelineItem,
     },
     Timeline as SdkTimeline,
 };
 use ratatui::{prelude::*, style::palette::tailwind, widgets::*};
 use tokio::{spawn, task::JoinHandle};
-use tracing::error;
+use tracing::{error, warn};
 use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _, EnvFilter};
 
 const HEADER_BG: Color = tailwind::BLUE.c950;
@@ -110,8 +111,8 @@ struct StatefulList<T> {
 
 #[derive(Default, PartialEq)]
 enum DetailsMode {
-    #[default]
     ReadReceipts,
+    #[default]
     TimelineItems,
     // Events // TODO: Soon™
 }
@@ -323,6 +324,101 @@ impl App {
         }
     }
 
+    async fn focus_live(&mut self) {
+        let Some(sdk_timeline) = self.get_selected_room_id(None).and_then(|room_id| {
+            self.timelines.lock().unwrap().get(&room_id).map(|timeline| timeline.timeline.clone())
+        }) else {
+            self.set_status_message("missing timeline for room".to_owned());
+            return;
+        };
+
+        let mut pagination = self.current_pagination.lock().unwrap();
+
+        // Cancel the previous back-pagination, if any.
+        if let Some(prev) = pagination.take() {
+            prev.abort();
+        }
+
+        // Start a new one, request batches of 20 events, stop after 10 timeline items
+        // have been added.
+        *pagination = Some(spawn(async move {
+            if !sdk_timeline.switch_focus(TimelineFocus::Live).await {
+                //self.set_status_message("couldn't switch focus back to live".to_owned());
+                error!("didn't switch back to live");
+            } else {
+                //self.set_status_message("switched back to live!".to_owned());
+            }
+        }));
+    }
+
+    async fn focus_event(&mut self) {
+        let Some(sdk_timeline) = self.get_selected_room_id(None).and_then(|room_id| {
+            self.timelines.lock().unwrap().get(&room_id).map(|timeline| timeline.timeline.clone())
+        }) else {
+            self.set_status_message("missing timeline for room".to_owned());
+            return;
+        };
+
+        // Pick the 10th item from the timeline, or the latest one, and abort if onone
+        // has been found.
+        let items = sdk_timeline.items().await;
+        let Some(target) = items
+            .get(10)
+            .or_else(|| {
+                warn!("not enough events to focus on a specific one, trying to get the first one");
+                items.get(0)
+            })
+            .and_then(|item| item.as_event()?.event_id())
+            .map(ToOwned::to_owned)
+        else {
+            self.set_status_message("no event to focus on".to_owned());
+            return;
+        };
+
+        let mut pagination = self.current_pagination.lock().unwrap();
+
+        // Cancel the previous back-pagination, if any.
+        if let Some(prev) = pagination.take() {
+            prev.abort();
+        }
+
+        // Start a new one, request batches of 20 events, stop after 10 timeline items
+        // have been added.
+        *pagination = Some(spawn(async move {
+            if !sdk_timeline.switch_focus(TimelineFocus::Event(target)).await {
+                return;
+            }
+
+            let mut i = 7;
+            let mut has_prev = true;
+            let mut has_next = true;
+
+            while i > 0 && (has_prev || has_next) {
+                i -= 1;
+
+                if has_prev {
+                    has_prev = match sdk_timeline.paginate_backward_focused().await {
+                        Ok(has_prev) => has_prev,
+                        Err(err) => {
+                            error!("when focus-back-paginating: {err}");
+                            false
+                        }
+                    }
+                }
+
+                if has_next {
+                    has_next = match sdk_timeline.paginate_forward_focused().await {
+                        Ok(has_next) => has_next,
+                        Err(err) => {
+                            error!("when focus-forward-paginating: {err}");
+                            false
+                        }
+                    }
+                }
+            }
+        }));
+    }
+
     /// Run a small back-pagination (expect a batch of 20 events, continue until
     /// we get 10 timeline items or hit the timeline start).
     async fn back_paginate(&mut self) {
@@ -415,6 +511,13 @@ impl App {
 
                             Char('b') if self.details_mode == DetailsMode::TimelineItems => {
                                 self.back_paginate().await;
+                            }
+
+                            Char('f') if self.details_mode == DetailsMode::TimelineItems => {
+                                self.focus_event().await;
+                            }
+                            Char('l') if self.details_mode == DetailsMode::TimelineItems => {
+                                self.focus_live().await;
                             }
 
                             Char('m') if self.details_mode == DetailsMode::ReadReceipts => {
